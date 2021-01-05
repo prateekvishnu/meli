@@ -19,6 +19,7 @@
  * along with meli. If not, see <http://www.gnu.org/licenses/>.
  */
 
+pub mod eventsource;
 use super::*;
 use isahc::config::Configurable;
 
