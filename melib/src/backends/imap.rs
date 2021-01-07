@@ -370,13 +370,13 @@ impl MailBackend for ImapType {
         let main_conn = self.connection.clone();
         let uid_store = self.uid_store.clone();
         Ok(Box::pin(async move {
-            let inbox = timeout(uid_store.timeout, uid_store.mailboxes.lock())
+            let mut inbox = timeout(uid_store.timeout, uid_store.mailboxes.lock())
                 .await?
                 .get(&mailbox_hash)
                 .map(std::clone::Clone::clone)
                 .unwrap();
             let mut conn = timeout(uid_store.timeout, main_conn.lock()).await?;
-            watch::examine_updates(inbox, &mut conn, &uid_store).await?;
+            watch::ImapWatcher::examine_updates(&mut inbox, &mut conn, &uid_store).await?;
             Ok(())
         }))
     }
@@ -450,68 +450,16 @@ impl MailBackend for ImapType {
         }))
     }
 
-    fn watch(&self) -> ResultFuture<()> {
+    fn watcher(&self) -> Result<Box<dyn BackendWatcher>> {
         let server_conf = self.server_conf.clone();
         let main_conn = self.connection.clone();
         let uid_store = self.uid_store.clone();
-        Ok(Box::pin(async move {
-            let has_idle: bool = match server_conf.protocol {
-                ImapProtocol::IMAP {
-                    extension_use: ImapExtensionUse { idle, .. },
-                } => {
-                    idle && uid_store
-                        .capabilities
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|cap| cap.eq_ignore_ascii_case(b"IDLE"))
-                }
-                _ => false,
-            };
-            while let Err(err) = if has_idle {
-                idle(ImapWatchKit {
-                    conn: ImapConnection::new_connection(&server_conf, uid_store.clone()),
-                    main_conn: main_conn.clone(),
-                    uid_store: uid_store.clone(),
-                })
-                .await
-            } else {
-                poll_with_examine(ImapWatchKit {
-                    conn: ImapConnection::new_connection(&server_conf, uid_store.clone()),
-                    main_conn: main_conn.clone(),
-                    uid_store: uid_store.clone(),
-                })
-                .await
-            } {
-                let mut main_conn_lck = timeout(uid_store.timeout, main_conn.lock()).await?;
-                if err.kind.is_network() {
-                    uid_store.is_online.lock().unwrap().1 = Err(err.clone());
-                } else {
-                    return Err(err);
-                }
-                debug!("Watch failure: {}", err.to_string());
-                match timeout(uid_store.timeout, main_conn_lck.connect())
-                    .await
-                    .and_then(|res| res)
-                {
-                    Err(err2) => {
-                        debug!("Watch reconnect attempt failed: {}", err2.to_string());
-                    }
-                    Ok(()) => {
-                        debug!("Watch reconnect attempt succesful");
-                        continue;
-                    }
-                }
-                let account_hash = uid_store.account_hash;
-                main_conn_lck.add_refresh_event(RefreshEvent {
-                    account_hash,
-                    mailbox_hash: 0,
-                    kind: RefreshEventKind::Failure(err.clone()),
-                });
-                return Err(err);
-            }
-            debug!("watch future returning");
-            Ok(())
+        Ok(Box::new(ImapWatcher {
+            main_conn,
+            uid_store,
+            mailbox_hashes: BTreeSet::default(),
+            polling_period: std::time::Duration::from_secs(5 * 60),
+            server_conf,
         }))
     }
 

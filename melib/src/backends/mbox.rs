@@ -147,6 +147,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub mod write;
 
+pub mod watch;
+
 pub type Offset = usize;
 pub type Length = usize;
 
@@ -184,7 +186,7 @@ fn get_rw_lock_blocking(f: &File, path: &Path) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct MboxMailbox {
+pub struct MboxMailbox {
     hash: MailboxHash,
     name: String,
     path: PathBuf,
@@ -950,157 +952,24 @@ impl MailBackend for MboxType {
         Err(MeliError::new("Unimplemented."))
     }
 
-    fn watch(&self) -> ResultFuture<()> {
-        let sender = self.event_consumer.clone();
-        let (tx, rx) = channel();
-        let mut watcher = watcher(tx, std::time::Duration::from_secs(10))
-            .map_err(|e| e.to_string())
-            .map_err(MeliError::new)?;
-        for f in self.mailboxes.lock().unwrap().values() {
-            watcher
-                .watch(&f.fs_path, RecursiveMode::Recursive)
-                .map_err(|e| e.to_string())
-                .map_err(MeliError::new)?;
-            debug!("watching {:?}", f.fs_path.as_path());
-        }
+    fn watcher(&self) -> Result<Box<dyn BackendWatcher>> {
         let account_hash = {
             let mut hasher = DefaultHasher::new();
             hasher.write(self.account_name.as_bytes());
             hasher.finish()
         };
-        let mailboxes = self.mailboxes.clone();
+        let event_consumer = self.event_consumer.clone();
         let mailbox_index = self.mailbox_index.clone();
-        let prefer_mbox_type = self.prefer_mbox_type;
-        Ok(Box::pin(async move {
-            loop {
-                match rx.recv() {
-                    /*
-                     * Event types:
-                     *
-                     * pub enum RefreshEventKind {
-                     *     Update(EnvelopeHash, Envelope), // Old hash, new envelope
-                     *     Create(Envelope),
-                     *     Remove(EnvelopeHash),
-                     *     Rescan,
-                     * }
-                     */
-                    Ok(event) => match event {
-                        /* Update */
-                        DebouncedEvent::NoticeWrite(pathbuf) | DebouncedEvent::Write(pathbuf) => {
-                            let mailbox_hash = get_path_hash!(&pathbuf);
-                            let file = match std::fs::OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .open(&pathbuf)
-                            {
-                                Ok(f) => f,
-                                Err(_) => {
-                                    continue;
-                                }
-                            };
-                            get_rw_lock_blocking(&file, &pathbuf)?;
-                            let mut mailbox_lock = mailboxes.lock().unwrap();
-                            let mut buf_reader = BufReader::new(file);
-                            let mut contents = Vec::new();
-                            if let Err(e) = buf_reader.read_to_end(&mut contents) {
-                                debug!(e);
-                                continue;
-                            };
-                            if contents.starts_with(mailbox_lock[&mailbox_hash].content.as_slice())
-                            {
-                                if let Ok((_, envelopes)) = mbox_parse(
-                                    mailbox_lock[&mailbox_hash].index.clone(),
-                                    &contents,
-                                    mailbox_lock[&mailbox_hash].content.len(),
-                                    prefer_mbox_type,
-                                ) {
-                                    let mut mailbox_index_lck = mailbox_index.lock().unwrap();
-                                    for env in envelopes {
-                                        mailbox_index_lck.insert(env.hash(), mailbox_hash);
-                                        (sender)(
-                                            account_hash,
-                                            BackendEvent::Refresh(RefreshEvent {
-                                                account_hash,
-                                                mailbox_hash,
-                                                kind: RefreshEventKind::Create(Box::new(env)),
-                                            }),
-                                        );
-                                    }
-                                }
-                            } else {
-                                (sender)(
-                                    account_hash,
-                                    BackendEvent::Refresh(RefreshEvent {
-                                        account_hash,
-                                        mailbox_hash,
-                                        kind: RefreshEventKind::Rescan,
-                                    }),
-                                );
-                            }
-                            mailbox_lock
-                                .entry(mailbox_hash)
-                                .and_modify(|f| f.content = contents);
-                        }
-                        /* Remove */
-                        DebouncedEvent::NoticeRemove(pathbuf) | DebouncedEvent::Remove(pathbuf) => {
-                            if mailboxes
-                                .lock()
-                                .unwrap()
-                                .values()
-                                .any(|f| f.fs_path == pathbuf)
-                            {
-                                let mailbox_hash = get_path_hash!(&pathbuf);
-                                (sender)(
-                                    account_hash,
-                                    BackendEvent::Refresh(RefreshEvent {
-                                        account_hash,
-                                        mailbox_hash,
-                                        kind: RefreshEventKind::Failure(MeliError::new(format!(
-                                            "mbox mailbox {} was removed.",
-                                            pathbuf.display()
-                                        ))),
-                                    }),
-                                );
-                                return Ok(());
-                            }
-                        }
-                        DebouncedEvent::Rename(src, dest) => {
-                            if mailboxes.lock().unwrap().values().any(|f| f.fs_path == src) {
-                                let mailbox_hash = get_path_hash!(&src);
-                                (sender)(
-                                    account_hash,
-                                    BackendEvent::Refresh(RefreshEvent {
-                                        account_hash,
-                                        mailbox_hash,
-                                        kind: RefreshEventKind::Failure(MeliError::new(format!(
-                                            "mbox mailbox {} was renamed to {}.",
-                                            src.display(),
-                                            dest.display()
-                                        ))),
-                                    }),
-                                );
-                                return Ok(());
-                            }
-                        }
-                        /* Trigger rescan of mailboxes */
-                        DebouncedEvent::Rescan => {
-                            for &mailbox_hash in mailboxes.lock().unwrap().keys() {
-                                (sender)(
-                                    account_hash,
-                                    BackendEvent::Refresh(RefreshEvent {
-                                        account_hash,
-                                        mailbox_hash,
-                                        kind: RefreshEventKind::Rescan,
-                                    }),
-                                );
-                            }
-                            return Ok(());
-                        }
-                        _ => {}
-                    },
-                    Err(e) => debug!("watch error: {:?}", e),
-                }
-            }
+        let mailboxes = self.mailboxes.clone();
+        let prefer_mbox_type = self.prefer_mbox_type.clone();
+        Ok(Box::new(watch::MboxWatcher {
+            account_hash,
+            event_consumer,
+            mailbox_hashes: BTreeSet::default(),
+            mailbox_index,
+            mailboxes,
+            polling_period: std::time::Duration::from_secs(60),
+            prefer_mbox_type,
         }))
     }
 

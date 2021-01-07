@@ -26,6 +26,8 @@ pub use self::backend::*;
 mod stream;
 pub use stream::*;
 
+pub mod watch;
+
 use crate::backends::*;
 use crate::email::Flag;
 use crate::error::{MeliError, Result};

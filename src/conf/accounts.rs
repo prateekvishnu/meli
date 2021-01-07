@@ -1068,9 +1068,23 @@ impl Account {
         }
 
         if !self.active_jobs.values().any(|j| j.is_watch()) {
-            match self.backend.read().unwrap().watch() {
-                Ok(fut) => {
-                    let handle = if self.backend_capabilities.is_async {
+            match self
+                .backend
+                .read()
+                .unwrap()
+                .watcher()
+                .and_then(|mut watcher| {
+                    for (mailbox_hash, _) in self
+                        .mailbox_entries
+                        .iter()
+                        .filter(|(_, m)| m.conf.mailbox_conf.subscribe.is_true())
+                    {
+                        watcher.register_mailbox(*mailbox_hash, MailboxWatchUrgency::High)?;
+                    }
+                    Ok((watcher.is_blocking(), watcher.spawn()?))
+                }) {
+                Ok((is_blocking, fut)) => {
+                    let handle = if is_blocking {
                         self.job_executor.spawn_specialized(fut)
                     } else {
                         self.job_executor.spawn_blocking(fut)

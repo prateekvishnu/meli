@@ -316,7 +316,12 @@ pub trait MailBackend: ::std::fmt::Debug + Send + Sync {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<Envelope>>> + Send + 'static>>>;
 
     fn refresh(&mut self, mailbox_hash: MailboxHash) -> ResultFuture<()>;
-    fn watch(&self) -> ResultFuture<()>;
+
+    /// Return a [`Box<dyn BackendWatcher>`](BackendWatcher), to which you can register the
+    /// mailboxes you are interested in for updates and then consume to spawn a watching `Future`.
+    /// The `Future` sends events to the [`BackendEventConsumer`](BackendEventConsumer) supplied to
+    /// the backend in its constructor method.
+    fn watcher(&self) -> Result<Box<dyn BackendWatcher>>;
     fn mailboxes(&self) -> ResultFuture<HashMap<MailboxHash, Mailbox>>;
     fn operation(&self, hash: EnvelopeHash) -> Result<Box<dyn BackendOp>>;
 
@@ -710,4 +715,32 @@ impl std::ops::Deref for IsSubscribedFn {
     fn deref(&self) -> &Box<dyn Fn(&str) -> bool + Send + Sync> {
         &self.0
     }
+}
+
+/// Urgency for the events of a single Mailbox.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum MailboxWatchUrgency {
+    High,
+    Medium,
+    Low,
+}
+
+/// Register the mailboxes you are interested in for updates and then consume with `spawn` to spawn
+/// a watching `Future`.  The `Future` sends events to the
+/// [`BackendEventConsumer`](backends::BackendEventConsumer) supplied to the backend in its constructor
+/// method.
+pub trait BackendWatcher: ::std::fmt::Debug + Send + Sync {
+    /// Whether the watcher's `Future` requires blocking I/O.
+    fn is_blocking(&self) -> bool;
+    fn register_mailbox(
+        &mut self,
+        mailbox_hash: MailboxHash,
+        urgency: MailboxWatchUrgency,
+    ) -> Result<()>;
+    fn set_polling_period(&mut self, period: Option<std::time::Duration>) -> Result<()>;
+    fn spawn(self: Box<Self>) -> ResultFuture<()>;
+    /// Use the [`Any`](std::any::Any) trait to get the underlying type implementing the
+    /// [`BackendWatcher`](backends::BackendEventConsumer) trait.
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }

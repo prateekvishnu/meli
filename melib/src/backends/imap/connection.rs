@@ -588,7 +588,9 @@ impl ImapConnection {
     pub fn connect<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             if let (time, ref mut status @ Ok(())) = *self.uid_store.is_online.lock().unwrap() {
-                if SystemTime::now().duration_since(time).unwrap_or_default() >= IMAP_PROTOCOL_TIMEOUT {
+                if SystemTime::now().duration_since(time).unwrap_or_default()
+                    >= IMAP_PROTOCOL_TIMEOUT
+                {
                     let err = MeliError::new("Connection timed out").set_kind(ErrorKind::Timeout);
                     *status = Err(err.clone());
                     self.stream = Err(err);

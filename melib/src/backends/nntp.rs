@@ -239,7 +239,7 @@ impl MailBackend for NntpType {
         }))
     }
 
-    fn watch(&self) -> ResultFuture<()> {
+    fn watcher(&self) -> Result<Box<dyn BackendWatcher>> {
         Err(MeliError::new("Unimplemented."))
     }
 

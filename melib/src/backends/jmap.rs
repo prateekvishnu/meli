@@ -90,6 +90,8 @@ use objects::*;
 pub mod mailbox;
 use mailbox::*;
 
+pub mod watch;
+
 #[derive(Debug, Default)]
 pub struct EnvelopeCache {
     bytes: Option<String>,
@@ -341,32 +343,12 @@ impl MailBackend for JmapType {
         }))
     }
 
-    fn watch(&self) -> ResultFuture<()> {
+    fn watcher(&self) -> Result<Box<dyn BackendWatcher>> {
         let connection = self.connection.clone();
-        let store = self.store.clone();
-        Ok(Box::pin(async move {
-            {
-                let mut conn = connection.lock().await;
-                conn.connect().await?;
-            }
-            loop {
-                {
-                    let mailbox_hashes = {
-                        store
-                            .mailboxes
-                            .read()
-                            .unwrap()
-                            .keys()
-                            .cloned()
-                            .collect::<SmallVec<[MailboxHash; 16]>>()
-                    };
-                    let conn = connection.lock().await;
-                    for mailbox_hash in mailbox_hashes {
-                        conn.email_changes(mailbox_hash).await?;
-                    }
-                }
-                crate::connections::sleep(std::time::Duration::from_secs(60)).await;
-            }
+        Ok(Box::new(watch::JmapWatcher {
+            connection,
+            mailbox_hashes: BTreeSet::default(),
+            polling_period: std::time::Duration::from_secs(60),
         }))
     }
 

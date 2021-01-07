@@ -67,6 +67,8 @@ pub use tags::*;
 mod thread;
 pub use thread::*;
 
+mod watch;
+
 #[derive(Debug)]
 pub struct DbConnection {
     pub lib: Arc<libloading::Library>,
@@ -232,7 +234,7 @@ unsafe impl Send for NotmuchDb {}
 unsafe impl Sync for NotmuchDb {}
 
 #[derive(Debug, Clone, Default)]
-struct NotmuchMailbox {
+pub struct NotmuchMailbox {
     hash: MailboxHash,
     children: Vec<MailboxHash>,
     parent: Option<MailboxHash>,
@@ -581,50 +583,29 @@ impl MailBackend for NotmuchDb {
         }))
     }
 
-    fn watch(&self) -> ResultFuture<()> {
-        extern crate notify;
-        use notify::{watcher, RecursiveMode, Watcher};
-
+    fn watcher(&self) -> Result<Box<dyn BackendWatcher>> {
         let account_hash = self.account_hash;
         let collection = self.collection.clone();
+        let event_consumer = self.event_consumer.clone();
+        let index = self.index.clone();
         let lib = self.lib.clone();
+        let mailbox_index = self.mailbox_index.clone();
+        let mailboxes = self.mailboxes.clone();
         let path = self.path.clone();
         let revision_uuid = self.revision_uuid.clone();
-        let mailboxes = self.mailboxes.clone();
-        let index = self.index.clone();
-        let mailbox_index = self.mailbox_index.clone();
-        let event_consumer = self.event_consumer.clone();
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = watcher(tx, std::time::Duration::from_secs(2)).unwrap();
-        watcher.watch(&self.path, RecursiveMode::Recursive).unwrap();
-        Ok(Box::pin(async move {
-            let _watcher = watcher;
-            let rx = rx;
-            loop {
-                let _ = rx.recv().map_err(|err| err.to_string())?;
-                {
-                    let mut database = NotmuchDb::new_connection(
-                        path.as_path(),
-                        revision_uuid.clone(),
-                        lib.clone(),
-                        false,
-                    )?;
-                    let new_revision_uuid = database.get_revision_uuid();
-                    if new_revision_uuid > *database.revision_uuid.read().unwrap() {
-                        database.refresh(
-                            mailboxes.clone(),
-                            index.clone(),
-                            mailbox_index.clone(),
-                            collection.tag_index.clone(),
-                            account_hash.clone(),
-                            event_consumer.clone(),
-                            new_revision_uuid,
-                        )?;
-                        *revision_uuid.write().unwrap() = new_revision_uuid;
-                    }
-                }
-            }
+        Ok(Box::new(watch::NotmuchWatcher {
+            account_hash,
+            collection,
+            event_consumer,
+            index,
+            lib,
+            mailbox_hashes: BTreeSet::default(),
+            mailbox_index,
+            mailboxes,
+            path,
+            polling_period: std::time::Duration::from_secs(3),
+            revision_uuid,
         }))
     }
 
