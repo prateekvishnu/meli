@@ -310,6 +310,14 @@ pub trait MailBackend: ::std::fmt::Debug + Send + Sync {
         Ok(Box::pin(async { Ok(()) }))
     }
 
+    fn fetch_batch(&mut self, env_hashes: EnvelopeHashBatch) -> ResultFuture<()> {
+        Err(MeliError::new("Unimplemented."))
+    }
+
+    fn load(&mut self, mailbox_hash: MailboxHash) -> ResultFuture<()> {
+        Err(MeliError::new("Unimplemented."))
+    }
+
     fn fetch(
         &mut self,
         mailbox_hash: MailboxHash,
@@ -628,7 +636,7 @@ impl EnvelopeHashBatch {
 #[derive(Default, Clone)]
 pub struct LazyCountSet {
     not_yet_seen: usize,
-    set: BTreeSet<EnvelopeHash>,
+    pub set: BTreeSet<EnvelopeHash>,
 }
 
 impl fmt::Debug for LazyCountSet {

@@ -449,6 +449,82 @@ impl MailBackend for NotmuchDb {
         Ok(Box::pin(async { Ok(()) }))
     }
 
+    fn load(&mut self, mailbox_hash: MailboxHash) -> ResultFuture<()> {
+        let database = NotmuchDb::new_connection(
+            self.path.as_path(),
+            self.revision_uuid.clone(),
+            self.lib.clone(),
+            false,
+        )?;
+        let mailboxes = self.mailboxes.clone();
+        let index = self.index.clone();
+        let mailbox_index = self.mailbox_index.clone();
+        let collection = self.collection.clone();
+        Ok(Box::pin(async move {
+            {
+                //crate::connections::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let mailboxes_lck = mailboxes.read().unwrap();
+            let mailbox = mailboxes_lck.get(&mailbox_hash).unwrap();
+            let query: Query = Query::new(&database, mailbox.query_str.as_str())?;
+            let mut unseen_total = 0;
+            let mut mailbox_index_lck = mailbox_index.write().unwrap();
+            let new_envelopes: HashMap<EnvelopeHash, Envelope> = query
+                .search()?
+                .into_iter()
+                .map(|m| {
+                    let env = m.into_envelope(&index, &collection.tag_index);
+                    mailbox_index_lck
+                        .entry(env.hash())
+                        .or_default()
+                        .push(mailbox_hash);
+                    if !env.is_seen() {
+                        unseen_total += 1;
+                    }
+                    (env.hash(), env)
+                })
+                .collect();
+            {
+                let mut total_lck = mailbox.total.lock().unwrap();
+                let mut unseen_lck = mailbox.unseen.lock().unwrap();
+                *total_lck = new_envelopes.len();
+                *unseen_lck = unseen_total;
+            }
+            collection.merge(new_envelopes, mailbox_hash, None);
+            let mut envelopes_lck = collection.envelopes.write().unwrap();
+            envelopes_lck.retain(|&k, _| k % 2 == 0);
+            Ok(())
+        }))
+    }
+
+    fn fetch_batch(&mut self, env_hashes: EnvelopeHashBatch) -> ResultFuture<()> {
+        let database = NotmuchDb::new_connection(
+            self.path.as_path(),
+            self.revision_uuid.clone(),
+            self.lib.clone(),
+            false,
+        )?;
+        let index = self.index.clone();
+        let collection = self.collection.clone();
+        Ok(Box::pin(async move {
+            //crate::connections::sleep(std::time::Duration::from_secs(2)).await;
+            debug!("fetch_batch {:?}", &env_hashes);
+            let mut envelopes_lck = collection.envelopes.write().unwrap();
+            for env_hash in env_hashes.iter() {
+                if envelopes_lck.contains_key(&env_hash) {
+                    continue;
+                }
+                let index_lck = index.write().unwrap();
+                let message = Message::find_message(&database, &index_lck[&env_hash])?;
+                drop(index_lck);
+                let env = message.into_envelope(&index, &collection.tag_index);
+                envelopes_lck.insert(env_hash, env);
+            }
+            debug!("fetch_batch {:?} done", &env_hashes);
+            Ok(())
+        }))
+    }
+
     fn fetch(
         &mut self,
         mailbox_hash: MailboxHash,

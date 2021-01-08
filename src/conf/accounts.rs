@@ -163,6 +163,13 @@ pub enum JobRequest {
     Mailboxes {
         handle: JoinHandle<Result<HashMap<MailboxHash, Mailbox>>>,
     },
+    Load {
+        mailbox_hash: MailboxHash,
+        handle: JoinHandle<Result<()>>,
+    },
+    FetchBatch {
+        handle: JoinHandle<Result<()>>,
+    },
     Fetch {
         mailbox_hash: MailboxHash,
         handle: JoinHandle<(
@@ -237,6 +244,8 @@ impl Drop for JobRequest {
         match self {
             JobRequest::Generic { handle, .. } |
             JobRequest::IsOnline { handle, .. } |
+            JobRequest::Load { handle, .. } |
+            JobRequest::FetchBatch { handle, .. } |
             JobRequest::Refresh { handle, .. } |
             JobRequest::SetFlags { handle, .. } |
             JobRequest::SaveMessage { handle, .. } |
@@ -275,6 +284,7 @@ impl core::fmt::Debug for JobRequest {
         match self {
             JobRequest::Generic { name, .. } => write!(f, "JobRequest::Generic({})", name),
             JobRequest::Mailboxes { .. } => write!(f, "JobRequest::Mailboxes"),
+            JobRequest::FetchBatch { .. } => write!(f, "JobRequest::FetchBatch",),
             JobRequest::Fetch { mailbox_hash, .. } => {
                 write!(f, "JobRequest::Fetch({})", mailbox_hash)
             }
@@ -302,6 +312,9 @@ impl core::fmt::Debug for JobRequest {
             JobRequest::SendMessageBackground { .. } => {
                 write!(f, "JobRequest::SendMessageBackground")
             }
+            JobRequest::Load { mailbox_hash, .. } => {
+                write!(f, "JobRequest::Load({})", mailbox_hash)
+            }
         }
     }
 }
@@ -312,6 +325,8 @@ impl core::fmt::Display for JobRequest {
             JobRequest::Generic { name, .. } => write!(f, "{}", name),
             JobRequest::Mailboxes { .. } => write!(f, "Get mailbox list"),
             JobRequest::Fetch { .. } => write!(f, "Mailbox fetch"),
+            JobRequest::FetchBatch { .. } => write!(f, "Fetch envelopes"),
+            JobRequest::Load { .. } => write!(f, "Mailbox load"),
             JobRequest::IsOnline { .. } => write!(f, "Online status check"),
             JobRequest::Refresh { .. } => write!(f, "Refresh mailbox"),
             JobRequest::SetFlags { env_hashes, .. } => write!(
@@ -347,6 +362,15 @@ impl JobRequest {
     pub fn is_watch(&self) -> bool {
         match self {
             JobRequest::Watch { .. } => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_load(&self, mailbox_hash: MailboxHash) -> bool {
+        match self {
+            JobRequest::Load {
+                mailbox_hash: h, ..
+            } if *h == mailbox_hash => true,
             _ => false,
         }
     }
@@ -658,8 +682,7 @@ impl Account {
                 {
                     let total = entry.ref_mailbox.count().ok().unwrap_or((0, 0)).1;
                     entry.status = MailboxStatus::Parsing(0, total);
-                    if let Ok(mailbox_job) = self.backend.write().unwrap().fetch(*h) {
-                        let mailbox_job = mailbox_job.into_future();
+                    if let Ok(mailbox_job) = self.backend.write().unwrap().load(*h) {
                         let handle = if self.backend_capabilities.is_async {
                             self.job_executor.spawn_specialized(mailbox_job)
                         } else {
@@ -671,9 +694,10 @@ impl Account {
                                 StatusEvent::NewJob(job_id),
                             )))
                             .unwrap();
+                        debug!("JobRequest::Load {} {:?}", *h, job_id);
                         self.active_jobs.insert(
                             job_id,
-                            JobRequest::Fetch {
+                            JobRequest::Load {
                                 mailbox_hash: *h,
                                 handle,
                             },
@@ -1133,6 +1157,73 @@ impl Account {
 
     pub fn hash(&self) -> AccountHash {
         self.hash
+    }
+
+    pub fn fetch_batch(&mut self, env_hashes: EnvelopeHashBatch) -> Result<JobId> {
+        debug!("account fetch_batch {:?}", &env_hashes);
+        let job = self.backend.write().unwrap().fetch_batch(env_hashes)?;
+        let handle = if self.backend_capabilities.is_async {
+            self.job_executor.spawn_specialized(job)
+        } else {
+            self.job_executor.spawn_blocking(job)
+        };
+        let job_id = handle.job_id;
+        self.insert_job(handle.job_id, JobRequest::FetchBatch { handle });
+        Ok(job_id)
+    }
+
+    pub fn load2(&mut self, mailbox_hash: MailboxHash) -> Result<Option<JobId>> {
+        debug!("account load2({}", mailbox_hash);
+        match self.mailbox_entries[&mailbox_hash].status {
+            MailboxStatus::Available => Ok(None),
+            MailboxStatus::Failed(ref err) => Err(err.clone()),
+            MailboxStatus::Parsing(_, _) | MailboxStatus::None => {
+                debug!("load2 find: ");
+                if let Some(job_id) = self
+                    .active_jobs
+                    .iter()
+                    .find(|(id, j)| {
+                        debug!(id);
+                        debug!(j).is_load(mailbox_hash)
+                    })
+                    .map(|(j, _)| *j)
+                {
+                    Ok(Some(job_id))
+                } else {
+                    let mailbox_job = self.backend.write().unwrap().load(mailbox_hash);
+                    match mailbox_job {
+                        Ok(mailbox_job) => {
+                            let handle = if self.backend_capabilities.is_async {
+                                self.job_executor.spawn_specialized(mailbox_job)
+                            } else {
+                                self.job_executor.spawn_blocking(mailbox_job)
+                            };
+                            let job_id = handle.job_id;
+                            debug!("JobRequest::Load {} {:?}", mailbox_hash, handle.job_id);
+                            self.insert_job(
+                                handle.job_id,
+                                JobRequest::Load {
+                                    mailbox_hash,
+                                    handle,
+                                },
+                            );
+                            Ok(Some(job_id))
+                        }
+                        Err(err) => {
+                            self.mailbox_entries
+                                .entry(mailbox_hash)
+                                .and_modify(|entry| {
+                                    entry.status = MailboxStatus::Failed(err.clone());
+                                });
+                            self.sender
+                                .send(ThreadEvent::UIEvent(UIEvent::StartupCheck(mailbox_hash)))
+                                .unwrap();
+                            Err(err)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn load(&mut self, mailbox_hash: MailboxHash) -> result::Result<(), usize> {
@@ -1637,6 +1728,57 @@ impl Account {
                         }
                     }
                 }
+                JobRequest::Load {
+                    mailbox_hash,
+                    ref mut handle,
+                    ..
+                } => {
+                    debug!("got mailbox load for {}", mailbox_hash);
+                    match handle.chan.try_recv() {
+                        Err(_) => {
+                            /* canceled */
+                            return true;
+                        }
+                        Ok(None) => {
+                            return true;
+                        }
+                        Ok(Some(Ok(()))) => {
+                            self.mailbox_entries
+                                .entry(mailbox_hash)
+                                .and_modify(|entry| {
+                                    entry.status = MailboxStatus::Available;
+                                });
+                            self.sender
+                                .send(ThreadEvent::UIEvent(UIEvent::MailboxUpdate((
+                                    self.hash,
+                                    mailbox_hash,
+                                ))))
+                                .unwrap();
+                            return true;
+                        }
+                        Ok(Some(Err(err))) => {
+                            self.sender
+                                .send(ThreadEvent::UIEvent(UIEvent::Notification(
+                                    Some(format!("{}: could not load mailbox", &self.name)),
+                                    err.to_string(),
+                                    Some(crate::types::NotificationType::Error(err.kind)),
+                                )))
+                                .expect("Could not send event on main channel");
+                            self.mailbox_entries
+                                .entry(mailbox_hash)
+                                .and_modify(|entry| {
+                                    entry.status = MailboxStatus::Failed(err);
+                                });
+                            self.sender
+                                .send(ThreadEvent::UIEvent(UIEvent::MailboxUpdate((
+                                    self.hash,
+                                    mailbox_hash,
+                                ))))
+                                .unwrap();
+                            return true;
+                        }
+                    }
+                }
                 JobRequest::Fetch {
                     mailbox_hash,
                     ref mut handle,
@@ -2115,6 +2257,17 @@ impl Account {
                                 )))
                                 .expect("Could not send event on main channel");
                         }
+                    }
+                }
+                JobRequest::FetchBatch { ref mut handle } => {
+                    if let Ok(Some(Err(err))) = handle.chan.try_recv() {
+                        self.sender
+                            .send(ThreadEvent::UIEvent(UIEvent::Notification(
+                                Some(format!("{}: envelope fetch failed", &self.name)),
+                                err.to_string(),
+                                Some(crate::types::NotificationType::Error(err.kind)),
+                            )))
+                            .expect("Could not send event on main channel");
                     }
                 }
                 JobRequest::Watch { ref mut handle } => {

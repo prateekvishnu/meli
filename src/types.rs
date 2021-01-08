@@ -285,6 +285,13 @@ pub mod segment_tree {
             max
         }
 
+        pub fn get(&self, index: usize) -> u8 {
+            if self.array.is_empty() {
+                return 0;
+            }
+            self.array[index]
+        }
+
         pub fn update(&mut self, pos: usize, value: u8) {
             let mut ctr = pos + self.array.len();
 

@@ -348,7 +348,7 @@ fn run_app(opt: Opt) -> Result<()> {
         state.register_component(Box::new(components::svg::SVGScreenshotFilter::new()));
         let window = Box::new(Tabbed::new(
             vec![
-                Box::new(listing::Listing::new(&mut state.context)),
+                Box::new(listing2::Listing::new(&mut state.context)),
                 Box::new(ContactList::new(&state.context)),
             ],
             &state.context,

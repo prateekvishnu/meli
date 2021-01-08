@@ -315,6 +315,147 @@ impl MailBackend for JmapType {
         }))
     }
 
+    fn load(&mut self, mailbox_hash: MailboxHash) -> ResultFuture<()> {
+        let store = self.store.clone();
+        let connection = self.connection.clone();
+        Ok(Box::pin(async move {
+            {
+                crate::connections::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let mailbox_id = store.mailboxes.read().unwrap()[&mailbox_hash].id.clone();
+            let email_query_call: EmailQuery = EmailQuery::new(
+                Query::new()
+                    .account_id(conn.mail_account_id().clone())
+                    .filter(Some(Filter::Condition(
+                        EmailFilterCondition::new()
+                            .in_mailbox(Some(mailbox_id))
+                            .into(),
+                    )))
+                    .position(0)
+                    .properties(Some(vec![
+                        "id".to_string(),
+                        "receivedAt".to_string(),
+                        "messageId".to_string(),
+                        "inReplyTo".to_string(),
+                        "hasAttachment".to_string(),
+                        "keywords".to_string(),
+                    ])),
+            )
+            .collapse_threads(false);
+
+            let mut req = Request::new(conn.request_no.clone());
+            let prev_seq = req.add_call(&email_query_call);
+
+            let email_call: EmailGet = EmailGet::new(
+                Get::new()
+                    .ids(Some(JmapArgument::reference(
+                        prev_seq,
+                        EmailQuery::RESULT_FIELD_IDS,
+                    )))
+                    .account_id(conn.mail_account_id().clone()),
+            );
+
+            req.add_call(&email_call);
+
+            let api_url = conn.session.lock().unwrap().api_url.clone();
+            let mut res = conn
+                .client
+                .post_async(api_url.as_str(), serde_json::to_string(&req)?)
+                .await?;
+
+            let res_text = res.text_async().await?;
+
+            let mut v: MethodResponse = serde_json::from_str(&res_text).unwrap();
+            let e = GetResponse::<EmailObject>::try_from(v.method_responses.pop().unwrap())?;
+            let query_response =
+                QueryResponse::<EmailObject>::try_from(v.method_responses.pop().unwrap())?;
+            store
+                .mailboxes
+                .write()
+                .unwrap()
+                .entry(mailbox_hash)
+                .and_modify(|mbox| {
+                    *mbox.email_query_state.lock().unwrap() = Some(query_response.query_state);
+                });
+            let GetResponse::<EmailObject> { list, state, .. } = e;
+            {
+                let (is_empty, is_equal) = {
+                    let mailboxes_lck = conn.store.mailboxes.read().unwrap();
+                    mailboxes_lck
+                        .get(&mailbox_hash)
+                        .map(|mbox| {
+                            let current_state_lck = mbox.email_state.lock().unwrap();
+                            (
+                                current_state_lck.is_none(),
+                                current_state_lck.as_ref() != Some(&state),
+                            )
+                        })
+                        .unwrap_or((true, true))
+                };
+                if is_empty {
+                    let mut mailboxes_lck = conn.store.mailboxes.write().unwrap();
+                    debug!("{:?}: inserting state {}", EmailObject::NAME, &state);
+                    mailboxes_lck.entry(mailbox_hash).and_modify(|mbox| {
+                        *mbox.email_state.lock().unwrap() = Some(state);
+                    });
+                } else if !is_equal {
+                    conn.email_changes(mailbox_hash).await?;
+                }
+            }
+            let mut total = BTreeSet::default();
+            let mut unread = BTreeSet::default();
+            let new_envelopes: HashMap<EnvelopeHash, Envelope> = list
+                .into_iter(|obj| {
+                    let env = store.add_envelope(obj);
+                    total.insert(env.hash());
+                    if !env.is_seen() {
+                        unread.insert(env.hash());
+                    }
+                    (env.hash(), env)
+                })
+                .collect();
+            let mut mailboxes_lck = store.mailboxes.write().unwrap();
+            mailboxes_lck.entry(mailbox_hash).and_modify(|mbox| {
+                mbox.total_emails.lock().unwrap().insert_existing_set(total);
+                mbox.unread_emails
+                    .lock()
+                    .unwrap()
+                    .insert_existing_set(unread);
+            });
+            let keys: BTreeSet<EnvelopeHash> = new_envelopes.keys().cloned().collect();
+            collection.merge(new_envelopes, mailbox_hash, None);
+            let mut envelopes_lck = collection.envelopes.write().unwrap();
+            envelopes_lck.retain(|k, _| !keys.contains(k));
+
+            Ok(())
+        }))
+    }
+
+    fn fetch_batch(&mut self, env_hashes: EnvelopeHashBatch) -> ResultFuture<()> {
+        todo!()
+        /*
+        let store = self.store.clone();
+        let connection = self.connection.clone();
+        Ok(Box::pin(async move {
+            //crate::connections::sleep(std::time::Duration::from_secs(2)).await;
+            debug!("fetch_batch {:?}", &env_hashes);
+            let mut envelopes_lck = collection.envelopes.write().unwrap();
+            for env_hash in env_hashes.iter() {
+                if envelopes_lck.contains_key(&env_hash) {
+                    continue;
+                }
+                let index_lck = index.write().unwrap();
+                let message = Message::find_message(&database, &index_lck[&env_hash])?;
+                drop(index_lck);
+                let env = message.into_envelope(&index, &collection.tag_index);
+                envelopes_lck.insert(env_hash, env);
+            }
+            debug!("fetch_batch {:?} done", &env_hashes);
+            Ok(())
+        }))
+            */
+    }
+
     fn fetch(
         &mut self,
         mailbox_hash: MailboxHash,

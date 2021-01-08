@@ -393,7 +393,7 @@ impl State {
             .contains_key(&mailbox_hash)
         {
             if self.context.accounts[&account_hash]
-                .load(mailbox_hash)
+                .load2(mailbox_hash)
                 .is_err()
             {
                 self.context.replies.push_back(UIEvent::from(event));

@@ -20,7 +20,6 @@
  */
 
 use super::*;
-use crate::thread::{ThreadHash, ThreadNode, ThreadNodeHash};
 
 #[derive(Clone)]
 pub struct Message<'m> {
@@ -186,22 +185,6 @@ impl<'m> Message<'m> {
         } else {
             None
         }
-    }
-
-    pub fn into_thread_node(&self) -> (ThreadNodeHash, ThreadNode) {
-        (
-            ThreadNodeHash::from(self.msg_id()),
-            ThreadNode {
-                message: Some(self.env_hash()),
-                parent: None,
-                other_mailbox: false,
-                children: vec![],
-                date: self.date(),
-                show_subject: true,
-                group: ThreadHash::new(),
-                unseen: false,
-            },
-        )
     }
 
     pub fn add_tag(&self, tag: &CStr) -> Result<()> {

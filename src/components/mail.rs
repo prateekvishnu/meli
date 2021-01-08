@@ -27,6 +27,7 @@ use melib::email::{attachment_types::*, attachments::*};
 use melib::thread::ThreadNodeHash;
 
 pub mod listing;
+pub mod listing2;
 pub use crate::listing::*;
 pub mod view;
 pub use crate::view::*;
