@@ -19,4 +19,4 @@ FROM ubuntu:20.04
 
 COPY --from=builder meli/fuzz/target/x86_64-unknown-linux-gnu/release/envelope_parse /
 
-
+RUN apt-get update -y && apt-get install -y libssl-dev libsqlite3-dev
